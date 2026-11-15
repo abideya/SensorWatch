@@ -102,7 +102,7 @@ def lambda_env(monkeypatch):
 def tables(monkeypatch):
     
     """Replaces db.table / db.client by mocks created on first use: tables['DATA_TABLE'], tables['sns'] ..."""
-from unittest.mock import MagicMock
+    from unittest.mock import MagicMock
     from common import db
 
     class Mocks(dict):
