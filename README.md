@@ -357,7 +357,7 @@ Follow an API-first approach by preparing the OpenAPI specification before imple
 
 ### Infrastructure
 
-Use Infrastructure as Code (IaC) through AWS SAM or CloudFormation to ensure reproducible deployment.
+Use Infrastructure as Code (IaaC) through AWS SAM or CloudFormation to ensure reproducible deployment.
 
 ### Quality Assurance
 
@@ -400,7 +400,7 @@ The architecture connects the IoT simulator, REST API, Lambda functions, DynamoD
 
 ### Architecture Diagram
 
-![SensorWatch AWS Architecture](docs/architecture.png)
+![SensorWatch AWS Architecture](docs/sensorwatch1.png)
 
 *Figure 1 – SensorWatch Serverless AWS Architecture*
 
