@@ -685,11 +685,8 @@ The main development priorities are:
 
 ---
 
-# License
-
-Academic project. License to be determined.
 
 ---
 
 **SensorWatch – IoT Cloud Monitoring & Anomaly Detection Platform**  
-*Serverless AWS Architecture | Academic Project | 2026–2027*
+*Serverless AWS Architecture | 2026–2027*
