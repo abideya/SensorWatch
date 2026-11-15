@@ -1,0 +1,23 @@
+{
+  "started_at": "2026-11-15T12:18:18.768Z",
+  "sensors": 2,
+  "interval_s": 2.0,
+  "duration_s": 10.0,
+  "requests": 10,
+  "success": 10,
+  "errors": 0,
+  "error_rate_percent": 0.0,
+  "throughput_rps": 1.0,
+  "latency_ms": {
+    "mean": 243.1,
+    "p50": 170.5,
+    "p95": 481.3,
+    "max": 481.3
+  },
+  "status_codes": {
+    "200": 10
+  },
+  "exceptions": {},
+  "rounds_late": 0,
+  "injected_events": []
+}
