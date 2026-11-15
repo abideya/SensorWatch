@@ -14,5 +14,8 @@ venv/
 .aws/
 *.pem
 *.key
+ simulator/results/
+*.zip
+placeholder/
 
 .DS_Store

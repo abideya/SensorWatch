@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  SensorWatch - File 1/4 - Network layer.
+  VPC, 2 private subnets (1 AZ), route table, security group,
+  2 gateway endpoints (S3, DynamoDB) and 4 interface endpoints (SNS, SQS, Logs, SSM).
+ 
+Parameters:
+  ProjectName:
+    Type: String
+    Default: SensorWatch
+    Description: Prefix used for names and export names (keep the same value in all 4 stacks)
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  PrivateSubnetACidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: Subnet A - API tier (authorizer, ingest, devices-and-query)
+  PrivateSubnetBCidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: Subnet B - event tier (analyze, offline-check, aggregate-export)
+ 
+Resources:
+  # ---------------------------------------------------------------- VPC
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true   # required for interface endpoints private DNS
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+ 
+  # ---------------------------------------------------------------- Subnets (one per AZ)
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs ""]   # us-east-1a
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-a-api-tier"
+ 
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs ""]   # us-east-1b
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-b-event-tier"
+ 
+  # ---------------------------------------------------------------- Routing (no IGW, no NAT: fully private)
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-rt"
+ 
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+ 
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+ 
+  # ---------------------------------------------------------------- Security groups
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Attached to all SensorWatch Lambda functions
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        # No NAT/IGW exists, so HTTPS can only reach the VPC endpoints below
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-lambda-sg"
+ 
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Attached to the interface endpoints (SNS, SQS, Logs, SSM)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-endpoint-sg"
+ 
+  # ---------------------------------------------------------------- Gateway endpoints (route table entries)
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+ 
+  DynamoDBGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+ 
+  # ---------------------------------------------------------------- Interface endpoints (ENIs in both subnets)
+  SnsInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sns"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+ 
+  SqsInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sqs"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+ 
+  LogsInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+ 
+  SsmInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+ 
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub "${ProjectName}-VpcId"
+  PrivateSubnetAId:
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub "${ProjectName}-PrivateSubnetAId"
+  PrivateSubnetBId:
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub "${ProjectName}-PrivateSubnetBId"
+  PrivateRouteTableId:
+    Value: !Ref PrivateRouteTable
+    Export:
+      Name: !Sub "${ProjectName}-PrivateRouteTableId"
+  LambdaSecurityGroupId:
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-LambdaSecurityGroupId"
+  EndpointSecurityGroupId:
+    Value: !Ref EndpointSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-EndpointSecurityGroupId"
+ 

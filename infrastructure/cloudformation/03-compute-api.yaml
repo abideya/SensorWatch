@@ -1,0 +1,630 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SensorWatch - File 3/4 - Compute and API layer.
+  6 Lambda functions (3 in subnet A = API tier, 3 in subnet B = event tier),
+  API Gateway REST (API key + usage plan + Lambda authorizer), DynamoDB Streams trigger,
+  EventBridge schedules (offline-check every 5 min, aggregate-export daily),
+  S3 static website for the dashboard. Uses LabRole only (no IAM resource created).
+  Requires stacks 1 and 2 deployed first; their outputs are passed as parameters (no ImportValue).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: SensorWatch
+    Description: Same value as in files 1 and 2
+  PrivateSubnetAId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Output PrivateSubnetAId of stack 1 (network)
+  PrivateSubnetBId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Output PrivateSubnetBId of stack 1 (network)
+  LambdaSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Output LambdaSecurityGroupId of stack 1 (network)
+  MeasurementsStreamArn:
+    Type: String
+    Description: Output MeasurementsStreamArn of stack 2 (data-messaging)
+  ExportsBucketName:
+    Type: String
+    Description: Output ExportsBucketName of stack 2 (data-messaging)
+  CodeBucket:
+    Type: String
+    Description: S3 bucket that already contains the Lambda zip files (create it before deploying, see README)
+  CodeKeyPrefix:
+    Type: String
+    Default: lambda/
+    Description: Key prefix of the zips - expected objects are authorizer.zip, ingest.zip, devices-query.zip, analyze.zip, offline-check.zip, aggregate-export.zip
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: HS256 secret used to sign/verify admin tokens (pass it at deploy time, never commit it)
+  StageName:
+    Type: String
+    Default: v1
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: CORS origin returned to the dashboard (use the dashboard website URL once known)
+  DeploymentTag:
+    Type: String
+    Default: "1"
+    Description: Change this value to force a new API Gateway deployment after an API change
+  MeasurementTtlDays:
+    Type: Number
+    Default: 7
+    Description: Number of days before DynamoDB TTL purges a raw measurement
+  OfflineCheckRate:
+    Type: String
+    Default: rate(5 minutes)
+    Description: Schedule of the offline-check Lambda
+  DailyExportCron:
+    Type: String
+    Default: cron(5 0 * * ? *)
+    Description: Schedule of the daily aggregate-export Lambda (UTC)
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+
+Resources:
+  # ================================================================ Log groups (7-day retention, cost control)
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-authorizer"
+      RetentionInDays: !Ref LogRetentionDays
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-ingest"
+      RetentionInDays: !Ref LogRetentionDays
+  DevicesQueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-devices-query"
+      RetentionInDays: !Ref LogRetentionDays
+  AnalyzeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-analyze"
+      RetentionInDays: !Ref LogRetentionDays
+  OfflineCheckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-offline-check"
+      RetentionInDays: !Ref LogRetentionDays
+  AggregateExportLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-aggregate-export"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ================================================================ API tier (private subnet A)
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AuthorizerLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-authorizer"
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub "${CodeKeyPrefix}authorizer.zip"
+      MemorySize: 128
+      Timeout: 5
+      Environment:
+        Variables:
+          JWT_SECRET: !Ref JwtSecret
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetAId]
+        SecurityGroupIds: [!Ref LambdaSecurityGroupId]
+
+  IngestFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IngestLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-ingest"
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub "${CodeKeyPrefix}ingest.zip"
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          MEASUREMENTS_TABLE: !Sub "${ProjectName}Measurements"
+          DEVICES_TABLE: !Sub "${ProjectName}Devices"
+          MEASUREMENT_TTL_DAYS: !Ref MeasurementTtlDays
+          TTL_ATTRIBUTE: expires_at
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetAId]
+        SecurityGroupIds: [!Ref LambdaSecurityGroupId]
+
+  DevicesQueryFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DevicesQueryLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-devices-query"
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub "${CodeKeyPrefix}devices-query.zip"
+      MemorySize: 256
+      Timeout: 15
+      Environment:
+        Variables:
+          DATA_TABLE: !Sub "${ProjectName}Data"
+          MEASUREMENTS_TABLE: !Sub "${ProjectName}Measurements"
+          DEVICES_TABLE: !Sub "${ProjectName}Devices"
+          USERS_TABLE: !Sub "${ProjectName}Users"
+          TECHNICIAN_TOPIC_ARN: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-technician-dispatch"
+          JWT_SECRET: !Ref JwtSecret
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetAId]
+        SecurityGroupIds: [!Ref LambdaSecurityGroupId]
+
+  # ================================================================ Event tier (private subnet B)
+  AnalyzeFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AnalyzeLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-analyze"
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub "${CodeKeyPrefix}analyze.zip"
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          DATA_TABLE: !Sub "${ProjectName}Data"
+          MEASUREMENTS_TABLE: !Sub "${ProjectName}Measurements"
+          DEVICES_TABLE: !Sub "${ProjectName}Devices"
+          THRESHOLDS_PREFIX: !Sub "/${ProjectName}/thresholds/"
+          ADMIN_ALERTS_TOPIC_ARN: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-admin-alerts"
+          TECHNICIAN_TOPIC_ARN: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-technician-dispatch"
+          ERROR_QUEUE_URL: !Sub "https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/${ProjectName}-error-queue"
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetBId]
+        SecurityGroupIds: [!Ref LambdaSecurityGroupId]
+
+  OfflineCheckFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OfflineCheckLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-offline-check"
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub "${CodeKeyPrefix}offline-check.zip"
+      MemorySize: 256
+      Timeout: 60
+      Environment:
+        Variables:
+          DATA_TABLE: !Sub "${ProjectName}Data"
+          DEVICES_TABLE: !Sub "${ProjectName}Devices"
+          THRESHOLDS_PREFIX: !Sub "/${ProjectName}/thresholds/"
+          ADMIN_ALERTS_TOPIC_ARN: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-admin-alerts"
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetBId]
+        SecurityGroupIds: [!Ref LambdaSecurityGroupId]
+
+  AggregateExportFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AggregateExportLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-aggregate-export"
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub "${CodeKeyPrefix}aggregate-export.zip"
+      MemorySize: 256
+      Timeout: 120
+      Environment:
+        Variables:
+          DATA_TABLE: !Sub "${ProjectName}Data"
+          MEASUREMENTS_TABLE: !Sub "${ProjectName}Measurements"
+          DEVICES_TABLE: !Sub "${ProjectName}Devices"
+          EXPORTS_BUCKET: !Ref ExportsBucketName
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetBId]
+        SecurityGroupIds: [!Ref LambdaSecurityGroupId]
+
+  # ================================================================ DynamoDB Streams -> analyze
+  AnalyzeStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref AnalyzeFunction
+      EventSourceArn: !Ref MeasurementsStreamArn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 0
+      MaximumRetryAttempts: 2
+      BisectBatchOnFunctionError: true
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"eventName": ["INSERT"]}'
+      DestinationConfig:
+        OnFailure:
+          Destination: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-error-queue"
+
+  # Failed async invocations (EventBridge) also land in the error queue
+  OfflineCheckInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref OfflineCheckFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 1
+      DestinationConfig:
+        OnFailure:
+          Destination: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-error-queue"
+
+  AggregateExportInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref AggregateExportFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 1
+      DestinationConfig:
+        OnFailure:
+          Destination: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-error-queue"
+
+  # ================================================================ EventBridge schedules
+  OfflineCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-offline-check-schedule"
+      Description: Detect silent devices (R5)
+      ScheduleExpression: !Ref OfflineCheckRate
+      State: ENABLED
+      Targets:
+        - Id: offline-check
+          Arn: !GetAtt OfflineCheckFunction.Arn
+
+  OfflineCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OfflineCheckFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OfflineCheckRule.Arn
+
+  DailyExportRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-daily-export-schedule"
+      Description: Daily statistics aggregation and S3 report export
+      ScheduleExpression: !Ref DailyExportCron
+      State: ENABLED
+      Targets:
+        - Id: aggregate-export
+          Arn: !GetAtt AggregateExportFunction.Arn
+
+  DailyExportPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AggregateExportFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyExportRule.Arn
+
+  # ================================================================ API Gateway REST
+  # Routes:
+  #   POST /measurements   -> API key (simulator)            -> ingest
+  #   POST /auth/login     -> public                          -> devices-query (issues the JWT)
+  #   ANY  /{proxy+}       -> Lambda authorizer (JWT, ADMIN)  -> devices-query
+  #        (devices, devices/{id}, devices/{id}/measurements, alerts, alerts/{id}/ack, stats, technicians ...)
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      Description: SensorWatch REST API
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      ApiKeySourceType: HEADER
+      Body:
+        openapi: "3.0.1"
+        info:
+          title: !Sub "${ProjectName}-api"
+          version: "1.0"
+        paths:
+          /measurements:
+            post:
+              security:
+                - api_key: []
+              responses:
+                "200":
+                  description: OK
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IngestFunction.Arn}/invocations"
+          /auth/login:
+            post:
+              responses:
+                "200":
+                  description: OK
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DevicesQueryFunction.Arn}/invocations"
+            options:
+              responses:
+                "200":
+                  description: CORS preflight
+                  headers:
+                    Access-Control-Allow-Origin:
+                      schema:
+                        type: string
+                    Access-Control-Allow-Methods:
+                      schema:
+                        type: string
+                    Access-Control-Allow-Headers:
+                      schema:
+                        type: string
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode": 200}'
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+                      method.response.header.Access-Control-Allow-Methods: "'GET,POST,PATCH,DELETE,OPTIONS'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,x-api-key'"
+          /{proxy+}:
+            x-amazon-apigateway-any-method:
+              security:
+                - AdminAuthorizer: []
+              parameters:
+                - name: proxy
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              responses:
+                "200":
+                  description: OK
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DevicesQueryFunction.Arn}/invocations"
+            options:
+              parameters:
+                - name: proxy
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              responses:
+                "200":
+                  description: CORS preflight
+                  headers:
+                    Access-Control-Allow-Origin:
+                      schema:
+                        type: string
+                    Access-Control-Allow-Methods:
+                      schema:
+                        type: string
+                    Access-Control-Allow-Headers:
+                      schema:
+                        type: string
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode": 200}'
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+                      method.response.header.Access-Control-Allow-Methods: "'GET,POST,PATCH,DELETE,OPTIONS'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,x-api-key'"
+        components:
+          securitySchemes:
+            api_key:
+              type: apiKey
+              name: x-api-key
+              in: header
+            AdminAuthorizer:
+              type: apiKey
+              name: Authorization
+              in: header
+              x-amazon-apigateway-authtype: custom
+              x-amazon-apigateway-authorizer:
+                type: request
+                identitySource: method.request.header.Authorization
+                authorizerUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations"
+                authorizerResultTtlInSeconds: 300
+
+  # CORS headers on errors produced by API Gateway itself (401, 403, 429 ...)
+  Default4xxResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref RestApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,x-api-key'"
+      ResponseTemplates:
+        application/json: '{"error":{"code":"$context.error.responseType","message":"$context.error.messageString"}}'
+
+  Default5xxResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref RestApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,x-api-key'"
+      ResponseTemplates:
+        application/json: '{"error":{"code":"$context.error.responseType","message":"$context.error.messageString"}}'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [Default4xxResponse, Default5xxResponse]
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: !Sub "SensorWatch deployment ${DeploymentTag}"
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 200
+          ThrottlingBurstLimit: 400
+          MetricsEnabled: true   # per-method CloudWatch metrics used in file 4
+
+  # Lambda invoke permissions for API Gateway
+  AuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/authorizers/*"
+
+  IngestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngestFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/measurements"
+
+  DevicesQueryPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DevicesQueryFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*"
+
+  # ---------------------------------------------------------------- API key + usage plan (simulator)
+  SimulatorApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiStage
+    Properties:
+      Name: !Sub "${ProjectName}-simulator-key"
+      Enabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiStage
+    Properties:
+      UsagePlanName: !Sub "${ProjectName}-simulator-plan"
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: !Ref StageName
+      Throttle:
+        RateLimit: 200
+        BurstLimit: 400
+      Quota:
+        Limit: 200000
+        Period: DAY
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref SimulatorApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # ================================================================ S3 static website (admin dashboard)
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DashboardBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadForStaticSite
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${DashboardBucket.Arn}/*"
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the REST API (put it in the simulator and the dashboard config)
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+    Export:
+      Name: !Sub "${ProjectName}-ApiUrl"
+  RestApiId:
+    Value: !Ref RestApi
+    Export:
+      Name: !Sub "${ProjectName}-RestApiId"
+  ApiStageName:
+    Value: !Ref StageName
+    Export:
+      Name: !Sub "${ProjectName}-ApiStageName"
+  SimulatorApiKeyId:
+    Description: "Get the value: aws apigateway get-api-key --api-key <id> --include-value --query value --output text"
+    Value: !Ref SimulatorApiKey
+    Export:
+      Name: !Sub "${ProjectName}-SimulatorApiKeyId"
+  DashboardBucketName:
+    Value: !Ref DashboardBucket
+    Export:
+      Name: !Sub "${ProjectName}-DashboardBucketName"
+  DashboardUrl:
+    Value: !GetAtt DashboardBucket.WebsiteURL
+    Export:
+      Name: !Sub "${ProjectName}-DashboardUrl"
+  AuthorizerFunctionName:
+    Value: !Ref AuthorizerFunction
+    Export:
+      Name: !Sub "${ProjectName}-AuthorizerFunctionName"
+  IngestFunctionName:
+    Value: !Ref IngestFunction
+    Export:
+      Name: !Sub "${ProjectName}-IngestFunctionName"
+  DevicesQueryFunctionName:
+    Value: !Ref DevicesQueryFunction
+    Export:
+      Name: !Sub "${ProjectName}-DevicesQueryFunctionName"
+  AnalyzeFunctionName:
+    Value: !Ref AnalyzeFunction
+    Export:
+      Name: !Sub "${ProjectName}-AnalyzeFunctionName"
+  OfflineCheckFunctionName:
+    Value: !Ref OfflineCheckFunction
+    Export:
+      Name: !Sub "${ProjectName}-OfflineCheckFunctionName"
+  AggregateExportFunctionName:
+    Value: !Ref AggregateExportFunction
+    Export:
+      Name: !Sub "${ProjectName}-AggregateExportFunctionName"

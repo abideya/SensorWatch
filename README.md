@@ -191,7 +191,7 @@ The administrator interacts with the monitoring dashboard and can:
 
 **Scheduler**
 
-- Every 2 minutes, checks devices that have stopped sending measurements.
+- Every 5 minutes, checks devices that have stopped sending measurements.
 - Marks silent devices as OFFLINE.
 - Every day, calculates aggregated statistics.
 - Exports daily reports to Amazon S3.
@@ -432,7 +432,8 @@ The architecture connects the IoT simulator, REST API, Lambda functions, DynamoD
 
 - DynamoDB Measurements.
 - DynamoDB SensorWatchData.
-
+- DynamoDB Devices
+- DynamoDB Users
 **5. Event and Messaging Layer**
 
 - DynamoDB Streams.

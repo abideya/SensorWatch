@@ -1,0 +1,365 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SensorWatch - File 2/4 - Data and messaging layer.
+  4 DynamoDB tables, S3 exports bucket, SQS error queue,
+  2 SNS topics and SSM Parameter Store thresholds.
+  These services are reached from the VPC through the endpoints created in file 1,
+  so this template needs no import from the network stack.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: SensorWatch
+    Description: Same value as in file 1 (used for names and export names)
+  MeasurementsTtlAttribute:
+    Type: String
+    Default: expires_at
+    Description: Attribute (epoch seconds) that DynamoDB TTL uses to purge old measurements
+  TemperatureMax:
+    Type: Number
+    Default: 45
+    Description: R1 - max temperature (Celsius)
+  TemperatureMin:
+    Type: Number
+    Default: 0
+    Description: R1 - min temperature (Celsius)
+  HumidityMin:
+    Type: Number
+    Default: 10
+    Description: R1 - min humidity (%)
+  HumidityMax:
+    Type: Number
+    Default: 80
+    Description: R1 - max humidity (%)
+  TemperatureDeltaMax:
+    Type: Number
+    Default: 10
+    Description: R2 - max absolute temperature difference between two consecutive measurements
+  ZScoreThreshold:
+    Type: Number
+    Default: 3
+    Description: R3 - Z-score above which a measurement is abnormal
+  ZScoreWindow:
+    Type: Number
+    Default: 20
+    Description: R3 - number of last measurements used for the Z-score
+  ZScoreMinSamples:
+    Type: Number
+    Default: 10
+    Description: R3 - minimum number of measurements before R3 is applied
+  BatteryMin:
+    Type: Number
+    Default: 15
+    Description: R4 - battery level (%) below which an alert is raised
+  OfflineAfterMinutes:
+    Type: Number
+    Default: 10
+    Description: R5 - a device with no measurement for this long is considered offline (checked every 5 min by the scheduler)
+
+Resources:
+  # ================================================================ DynamoDB
+  # Main table: alerts, device state, stats (single-table design)
+  #   pk / sk examples: ALERT#<alert_id> / META, DEVICE#<device_id> / STATE, STATS#<day> / <device_id>
+  #   gsi1: alerts by status      (gsi1pk = ALERT_STATUS#OPEN,  gsi1sk = created_at)
+  #   gsi2: alerts by device      (gsi2pk = DEVICE#<device_id>, gsi2sk = created_at)
+  SensorWatchDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}Data"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+        - AttributeName: gsi2pk
+          AttributeType: S
+        - AttributeName: gsi2sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: gsi2
+          KeySchema:
+            - AttributeName: gsi2pk
+              KeyType: HASH
+            - AttributeName: gsi2sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Raw measurements: TTL purge + Streams (triggers Lambda analyze)
+  # (device_id, timestamp) is unique: a conditional put makes ingestion idempotent (FR4)
+  MeasurementsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}Measurements"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: device_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S   # ISO-8601 UTC, e.g. 2026-10-05T09:15:00Z (sorts chronologically)
+      KeySchema:
+        - AttributeName: device_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: !Ref MeasurementsTtlAttribute
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Registered devices (site, type, last_seen ...)
+  DevicesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}Devices"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: device_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: device_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Users (JWT roles ADMIN / TECHNICIAN); role-index lists the technicians
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}Users"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: role
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: role-index
+          KeySchema:
+            - AttributeName: role
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================================================ S3
+  ExportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================================================ SQS
+  # Failure destination for Lambdas (alarm on depth is created in file 4)
+  ErrorQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-error-queue"
+      MessageRetentionPeriod: 1209600   # 14 days
+      SqsManagedSseEnabled: true
+
+  # ================================================================ SNS
+  AdminAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-admin-alerts"
+      DisplayName: SensorWatch admin alerts
+
+  # Subscriptions with a filter policy on technician_id are added at runtime
+  TechnicianDispatchTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-technician-dispatch"
+      DisplayName: SensorWatch technician dispatch
+
+  # ================================================================ SSM Parameter Store (thresholds)
+  TemperatureMaxParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/thresholds/temperature-max"
+      Type: String
+      Value: !Ref TemperatureMax
+      Description: R1 - max temperature
+
+  TemperatureMinParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/thresholds/temperature-min"
+      Type: String
+      Value: !Ref TemperatureMin
+      Description: R1 - min temperature
+
+  HumidityMaxParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/thresholds/humidity-max"
+      Type: String
+      Value: !Ref HumidityMax
+      Description: R1 - max humidity
+
+  HumidityMinParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/thresholds/humidity-min"
+      Type: String
+      Value: !Ref HumidityMin
+      Description: R1 - min humidity
+
+  TemperatureDeltaMaxParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/thresholds/temperature-delta-max"
+      Type: String
+      Value: !Ref TemperatureDeltaMax
+      Description: R2 - sudden variation delta
+
+  ZScoreThresholdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/thresholds/zscore-threshold"
+      Type: String
+      Value: !Ref ZScoreThreshold
+      Description: R3 - Z-score threshold
+
+  ZScoreWindowParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/thresholds/zscore-window"
+      Type: String
+      Value: !Ref ZScoreWindow
+      Description: R3 - window size
+
+  ZScoreMinSamplesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/thresholds/zscore-min-samples"
+      Type: String
+      Value: !Ref ZScoreMinSamples
+      Description: R3 - minimum samples
+
+  BatteryMinParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/thresholds/battery-min"
+      Type: String
+      Value: !Ref BatteryMin
+      Description: R4 - low battery level
+
+  OfflineAfterMinutesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/thresholds/offline-after-minutes"
+      Type: String
+      Value: !Ref OfflineAfterMinutes
+      Description: R5 - minutes without data before a device is flagged offline
+
+Outputs:
+  SensorWatchDataTableName:
+    Value: !Ref SensorWatchDataTable
+    Export:
+      Name: !Sub "${ProjectName}-DataTableName"
+  SensorWatchDataTableArn:
+    Value: !GetAtt SensorWatchDataTable.Arn
+    Export:
+      Name: !Sub "${ProjectName}-DataTableArn"
+  MeasurementsTableName:
+    Value: !Ref MeasurementsTable
+    Export:
+      Name: !Sub "${ProjectName}-MeasurementsTableName"
+  MeasurementsTableArn:
+    Value: !GetAtt MeasurementsTable.Arn
+    Export:
+      Name: !Sub "${ProjectName}-MeasurementsTableArn"
+  MeasurementsStreamArn:
+    Value: !GetAtt MeasurementsTable.StreamArn
+    Export:
+      Name: !Sub "${ProjectName}-MeasurementsStreamArn"
+  DevicesTableName:
+    Value: !Ref DevicesTable
+    Export:
+      Name: !Sub "${ProjectName}-DevicesTableName"
+  DevicesTableArn:
+    Value: !GetAtt DevicesTable.Arn
+    Export:
+      Name: !Sub "${ProjectName}-DevicesTableArn"
+  UsersTableName:
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub "${ProjectName}-UsersTableName"
+  UsersTableArn:
+    Value: !GetAtt UsersTable.Arn
+    Export:
+      Name: !Sub "${ProjectName}-UsersTableArn"
+  ExportsBucketName:
+    Value: !Ref ExportsBucket
+    Export:
+      Name: !Sub "${ProjectName}-ExportsBucketName"
+  ExportsBucketArn:
+    Value: !GetAtt ExportsBucket.Arn
+    Export:
+      Name: !Sub "${ProjectName}-ExportsBucketArn"
+  ErrorQueueUrl:
+    Value: !Ref ErrorQueue
+    Export:
+      Name: !Sub "${ProjectName}-ErrorQueueUrl"
+  ErrorQueueArn:
+    Value: !GetAtt ErrorQueue.Arn
+    Export:
+      Name: !Sub "${ProjectName}-ErrorQueueArn"
+  ErrorQueueName:
+    Value: !GetAtt ErrorQueue.QueueName
+    Export:
+      Name: !Sub "${ProjectName}-ErrorQueueName"
+  AdminAlertsTopicArn:
+    Value: !Ref AdminAlertsTopic
+    Export:
+      Name: !Sub "${ProjectName}-AdminAlertsTopicArn"
+  TechnicianDispatchTopicArn:
+    Value: !Ref TechnicianDispatchTopic
+    Export:
+      Name: !Sub "${ProjectName}-TechnicianDispatchTopicArn"
+  ThresholdsParameterPrefix:
+    Value: !Sub "/${ProjectName}/thresholds/"
+    Export:
+      Name: !Sub "${ProjectName}-ThresholdsPrefix"

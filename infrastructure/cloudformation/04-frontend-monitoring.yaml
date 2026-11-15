@@ -1,0 +1,345 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  SensorWatch - File 4/4 - Monitoring.
+  CloudWatch alarms (error queue, Lambda errors, API 5XX / latency, stream lag),
+  optional e-mail subscription on the admin-alerts SNS topic and a CloudWatch dashboard.
+  The dashboard website bucket (frontend) is already created in file 3.
+  No import from other stacks: resource names are derived from ProjectName.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: SensorWatch
+    Description: Same value as in files 1, 2 and 3
+  StageName:
+    Type: String
+    Default: v1
+    Description: Same API stage name as in file 3
+  AdminEmail:
+    Type: String
+    Default: ""
+    Description: Optional - e-mail subscribed to the admin-alerts topic (AWS sends a confirmation link)
+  ApiLatencyP95Ms:
+    Type: Number
+    Default: 3000
+    Description: Alarm when the API p95 latency exceeds this value (ms)
+  StreamLagMs:
+    Type: Number
+    Default: 20000
+    Description: Alarm when the oldest unprocessed measurement is older than this (ms) - objective O2 is 20 s
+
+Conditions:
+  HasAdminEmail: !Not [!Equals [!Ref AdminEmail, ""]]
+
+Resources:
+  # ================================================================ Notification
+  AdminEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAdminEmail
+    Properties:
+      TopicArn: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-admin-alerts"
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+
+  # ================================================================ Alarms
+  # Anything that lands in the error queue means an analysis failed (no silent loss)
+  ErrorQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-error-queue-not-empty"
+      AlarmDescription: Messages are waiting in the SQS error queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub "${ProjectName}-error-queue"
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-admin-alerts"
+
+  AnalyzeErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-analyze-errors"
+      AlarmDescription: The analyze Lambda raised errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${ProjectName}-analyze"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-admin-alerts"
+
+  # One alarm on the sum of the errors of the 6 functions (FILL avoids gaps when a function has no data)
+  AnyLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-lambda-errors-total"
+      AlarmDescription: At least one SensorWatch Lambda failed in the last 5 minutes
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-admin-alerts"
+      Metrics:
+        - Id: total
+          Expression: "FILL(m1,0)+FILL(m2,0)+FILL(m3,0)+FILL(m4,0)+FILL(m5,0)+FILL(m6,0)"
+          Label: Total Lambda errors
+          ReturnData: true
+        - Id: m1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Sub "${ProjectName}-authorizer" }]
+            Period: 300
+            Stat: Sum
+        - Id: m2
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Sub "${ProjectName}-ingest" }]
+            Period: 300
+            Stat: Sum
+        - Id: m3
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Sub "${ProjectName}-devices-query" }]
+            Period: 300
+            Stat: Sum
+        - Id: m4
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Sub "${ProjectName}-analyze" }]
+            Period: 300
+            Stat: Sum
+        - Id: m5
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Sub "${ProjectName}-offline-check" }]
+            Period: 300
+            Stat: Sum
+        - Id: m6
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Sub "${ProjectName}-aggregate-export" }]
+            Period: 300
+            Stat: Sum
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-api-5xx"
+      AlarmDescription: The API returned server errors
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${ProjectName}-api"
+        - Name: Stage
+          Value: !Ref StageName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-admin-alerts"
+
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-api-latency-p95"
+      AlarmDescription: API p95 latency is above the configured limit
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${ProjectName}-api"
+        - Name: Stage
+          Value: !Ref StageName
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ApiLatencyP95Ms
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-admin-alerts"
+
+  # Delay between a measurement being stored and analyze reading it (anomaly detection delay, objective O2)
+  StreamLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-analyze-stream-lag"
+      AlarmDescription: Measurements wait too long before being analyzed
+      Namespace: AWS/Lambda
+      MetricName: IteratorAge
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${ProjectName}-analyze"
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref StreamLagMs
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-admin-alerts"
+
+  # ================================================================ CloudWatch dashboard
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-monitoring"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "API requests and errors",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "${ProjectName}-api", "Stage", "${StageName}"],
+                  [".", "4XXError", ".", ".", ".", "."],
+                  [".", "5XXError", ".", ".", ".", "."]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "API latency (ms)",
+                "region": "${AWS::Region}", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/ApiGateway", "Latency", "ApiName", "${ProjectName}-api", "Stage", "${StageName}", { "stat": "Average" }],
+                  ["...", { "stat": "p95" }],
+                  ["...", { "stat": "Maximum" }]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda invocations",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-ingest"],
+                  ["...", "${ProjectName}-analyze"],
+                  ["...", "${ProjectName}-devices-query"],
+                  ["...", "${ProjectName}-offline-check"],
+                  ["...", "${ProjectName}-aggregate-export"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda errors",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-authorizer"],
+                  ["...", "${ProjectName}-ingest"],
+                  ["...", "${ProjectName}-analyze"],
+                  ["...", "${ProjectName}-devices-query"],
+                  ["...", "${ProjectName}-offline-check"],
+                  ["...", "${ProjectName}-aggregate-export"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Analysis delay - stream iterator age (ms)",
+                "region": "${AWS::Region}", "stat": "Maximum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Lambda", "IteratorAge", "FunctionName", "${ProjectName}-analyze"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Error queue (messages waiting)",
+                "region": "${AWS::Region}", "stat": "Maximum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ProjectName}-error-queue"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 18, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda duration - ingest and analyze (ms)",
+                "region": "${AWS::Region}", "stat": "Average", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-ingest"],
+                  ["...", "${ProjectName}-analyze"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 18, "width": 12, "height": 6,
+              "properties": {
+                "title": "DynamoDB write capacity consumed",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${ProjectName}Measurements"],
+                  ["...", "${ProjectName}Data"]
+                ]
+              }
+            },
+            {
+              "type": "alarm", "x": 0, "y": 24, "width": 24, "height": 4,
+              "properties": {
+                "title": "SensorWatch alarms",
+                "alarms": [
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-error-queue-not-empty",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-analyze-errors",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-lambda-errors-total",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-api-5xx",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-api-latency-p95",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-analyze-stream-lag"
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  MonitoringDashboardName:
+    Value: !Ref MonitoringDashboard
+  MonitoringDashboardUrl:
+    Description: Open this link in the AWS console
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-monitoring"
+  AlarmNames:
+    Value: !Sub "${ProjectName}-error-queue-not-empty, ${ProjectName}-analyze-errors, ${ProjectName}-lambda-errors-total, ${ProjectName}-api-5xx, ${ProjectName}-api-latency-p95, ${ProjectName}-analyze-stream-lag"
