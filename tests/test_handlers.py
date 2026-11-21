@@ -3,7 +3,7 @@ import json
 from decimal import Decimal
 
 import pytest
-
+from types import SimpleNamespace
 from common import config, jwt_utils
 from conftest import load_handler
 
@@ -110,6 +110,19 @@ def stream_record(**changes):
              "temperature": {"N": values["temperature"]}, "humidity": {"N": values["humidity"]},
              "battery": {"N": values["battery"]}}
     return {"eventName": "INSERT", "dynamodb": {"NewImage": image}}
+CONTEXT = SimpleNamespace(aws_request_id="req-test-1")
+
+
+def alerts_written(tables):
+    """Alert items put in DATA_TABLE (the analysis marker ANALYSIS#... is also written there)."""
+    items = [c.kwargs["Item"] for c in tables["DATA_TABLE"].put_item.call_args_list]
+    return [i for i in items if i["pk"].startswith("ALERT#")]
+
+
+def state_update(tables):
+    """The update_item call that refreshes DEVICE#<id> / STATE (the last call completes the analysis marker)."""
+    calls = [c.kwargs for c in tables["DATA_TABLE"].update_item.call_args_list]
+    return next(c for c in calls if c["Key"]["pk"].startswith("DEVICE#"))
 
 
 def test_analyze_creates_an_alert_updates_the_state_and_notifies(tables, monkeypatch):

@@ -31,6 +31,8 @@ DEFAULT_COOLDOWN_SECONDS = int(
 
 ANALYSIS_LEASE_SECONDS = 900
 
+# Analysis markers are purged by DynamoDB TTL (attribute expires_at) after 7 days.
+ANALYSIS_MARKER_TTL_SECONDS = 7 * 86400
 
 # ---------------------------------------------------------
 # 1. Analysis idempotency lock
@@ -52,7 +54,8 @@ def _claim_analysis(data, device_id, timestamp, request_id):
                 **key,
                 "status": "PROCESSING",
                 "owner": request_id,
-                "lease_until": now + ANALYSIS_LEASE_SECONDS
+                "lease_until": now + ANALYSIS_LEASE_SECONDS,
+                "expires_at": now + ANALYSIS_MARKER_TTL_SECONDS
             },
             ConditionExpression="attribute_not_exists(pk)"
         )
@@ -335,6 +338,7 @@ def process_measurement(measurement, thresholds):
         if is_new:
             to_notify.append(alert)
 
+
     # Update device state.
     names = {
         "#c": "connectivity"
@@ -344,7 +348,6 @@ def process_measurement(measurement, thresholds):
         ":on": "ONLINE",
         ":d": device_id,
         ":n": len(counted),
-        ":now": now_epoch,
         ":ls": (
             measurement.get("received_at")
             or db.iso_now()
@@ -364,10 +367,11 @@ def process_measurement(measurement, thresholds):
         "device_id = :d"
     ]
 
+    if counted:
+        values[":now"] = now_epoch
+
     for index, (cooldown_key, _) in enumerate(counted):
-
         names[f"#cd{index}"] = cooldown_key
-
         assignments.append(
             f"#cd{index} = :now"
         )
@@ -453,7 +457,10 @@ def handler(event, context):
         device_id = measurement["device_id"]
         timestamp = measurement["timestamp"]
 
-        request_id = context.aws_request_id
+        request_id = getattr(context, "aws_request_id", None) or ids.alert_id(
+            device_id, timestamp, "REQUEST", str(time.time())
+        )
+
 
         claimed = _claim_analysis(
             data,

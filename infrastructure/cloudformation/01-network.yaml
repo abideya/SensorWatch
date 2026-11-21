@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: 2010-09-09
 Description: >
   SensorWatch - File 1/4 - Network layer.
-  VPC, 2 private subnets (1 AZ), route table, security group,
+  VPC, 2 private subnets ( 2 AZ), route table, security group,
   2 gateway endpoints (S3, DynamoDB) and 4 interface endpoints (SNS, SQS, Logs, SSM).
  
 Parameters:
